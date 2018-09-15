@@ -19,13 +19,15 @@
 #include "auth.h"
 #include "http.h"
 #include "auth_negotiate.h"
+#include "auth_ntlm.h"
 #include "streams/tls.h"
 #include "streams/socket.h"
 #include "streams/curl.h"
 
 git_http_auth_scheme auth_schemes[] = {
-	{ GIT_AUTHTYPE_NEGOTIATE, "Negotiate", GIT_CREDTYPE_DEFAULT, git_http_auth_negotiate },
-	{ GIT_AUTHTYPE_BASIC, "Basic", GIT_CREDTYPE_USERPASS_PLAINTEXT, git_http_auth_basic },
+	{ GIT_AUTHTYPE_NEGOTIATE, "Negotiate", GIT_CREDTYPE_DEFAULT, 0, git_http_auth_negotiate },
+	{ GIT_AUTHTYPE_NTLM, "NTLM", GIT_CREDTYPE_USERPASS_PLAINTEXT, 0, git_http_auth_ntlm },
+	{ GIT_AUTHTYPE_BASIC, "Basic", GIT_CREDTYPE_USERPASS_PLAINTEXT, 1, git_http_auth_basic },
 };
 
 static const char *upload_pack_service = "upload-pack";
@@ -89,6 +91,7 @@ typedef struct {
 	unsigned parse_finished : 1;
 
 	/* Authentication */
+	git_http_authtype_t server_types;
 	git_cred *cred;
 	git_cred *url_cred;
 	git_vector auth_contexts;
@@ -104,13 +107,6 @@ typedef struct {
 	size_t *bytes_read;
 } parser_context;
 
-static bool credtype_match(git_http_auth_scheme *scheme, void *data)
-{
-	unsigned int credtype = *(unsigned int *)data;
-
-	return !!(scheme->credtypes & credtype);
-}
-
 static bool challenge_match(git_http_auth_scheme *scheme, void *data)
 {
 	const char *scheme_name = scheme->name;
@@ -118,8 +114,31 @@ static bool challenge_match(git_http_auth_scheme *scheme, void *data)
 	size_t scheme_len;
 
 	scheme_len = strlen(scheme_name);
+	printf("challenge? %.*s vs %.*s\n", scheme_len, challenge, scheme_len, scheme_name);
 	return (strncasecmp(challenge, scheme_name, scheme_len) == 0 &&
-		(challenge[scheme_len] == '\0' || challenge[scheme_len] == ' '));
+	    (challenge[scheme_len] == '\0' || challenge[scheme_len] == ' '));
+}
+
+static bool preauth_match(git_http_auth_scheme *scheme, void *data)
+{
+	unsigned int credtype = *(unsigned int *)data;
+	return scheme->preauth && !!(scheme->credtypes & credtype);
+}
+
+typedef struct {
+	git_http_authtype_t server_types;
+	unsigned int credtype;
+} authmatch_data;
+
+static bool auth_match(git_http_auth_scheme *scheme, void *_data)
+{
+	authmatch_data *data = (authmatch_data *)_data;
+
+	printf("server types: %x / scheme type: %x\n", data->server_types, scheme->type);
+	printf("scheme cred types: %x / our cred type: %x\n", scheme->credtypes, data->credtype);
+
+	return !!(data->server_types & scheme->type) &&
+		!!(scheme->credtypes & data->credtype);
 }
 
 static int auth_context_match(
@@ -135,7 +154,9 @@ static int auth_context_match(
 	*out = NULL;
 
 	for (i = 0; i < ARRAY_SIZE(auth_schemes); i++) {
+		printf("trying... %p / %s\n", &auth_schemes[i], auth_schemes[i].name);
 		if (scheme_match(&auth_schemes[i], data)) {
+			printf("scheme match: %p / %s\n", &auth_schemes[i], auth_schemes[i].name);
 			scheme = &auth_schemes[i];
 			break;
 		}
@@ -144,6 +165,8 @@ static int auth_context_match(
 	if (!scheme)
 		return 0;
 
+	printf("scheme is: %p / %s\n", scheme, scheme->name);
+
 	/* See if authentication has already started for this scheme */
 	git_vector_foreach(&t->auth_contexts, i, c) {
 		if (c->type == scheme->type) {
@@ -151,6 +174,8 @@ static int auth_context_match(
 			break;
 		}
 	}
+
+	printf("context? %p\n", context);
 
 	if (!context) {
 		if (scheme->init_context(&context, &t->connection_data) < 0)
@@ -161,33 +186,82 @@ static int auth_context_match(
 			return -1;
 	}
 
+	printf("context now: %p\n", context);
+
 	*out = context;
 
 	return 0;
 }
 
-static int apply_credentials(git_buf *buf, http_subtransport *t)
+static int apply_preauthentication(git_buf *buf, http_subtransport *t)
+{
+	git_http_auth_context *context;
+	unsigned int credtype;
+
+	printf("Pre-authenticating...\n");
+
+	if (!t->connection_data.user || !t->connection_data.pass)
+		return 0;
+
+	if (!t->url_cred &&
+		git_cred_userpass_plaintext_new(&t->url_cred,
+			t->connection_data.user, t->connection_data.pass) < 0)
+		return -1;
+
+	if (!t->url_cred)
+		return 0;
+
+	credtype = t->url_cred->credtype;
+
+	/*
+	 * Try to find a scheme that supports pre-authentication (ie,
+	 * Basic).  No error if there isn't one, we'll do a round-trip
+	 * to the server to negotiate mechanisms.
+	 */
+	if (auth_context_match(&context, t, preauth_match, &credtype) < 0)
+		return -1;
+	else if (!context)
+		return 0;
+
+	return context->next_token(buf, context, t->url_cred);
+}
+
+static int apply_authentication(git_buf *buf, http_subtransport *t)
 {
 	git_cred *cred = t->cred;
-	git_http_auth_context *context;
+	git_http_auth_context *context = NULL;
+	authmatch_data data = {0};
 
-	/* Apply the credentials given to us in the URL */
-	if (!cred && t->connection_data.user && t->connection_data.pass) {
-		if (!t->url_cred &&
-			git_cred_userpass_plaintext_new(&t->url_cred,
-				t->connection_data.user, t->connection_data.pass) < 0)
-			return -1;
+	printf("applying creds...\n");
 
-		cred = t->url_cred;
-	}
+	/*
+	 * We have not asked the caller for credentials from a callback;
+	 * see if they've pre-provided us with some (in the URL, for example).
+	 */
+	if (!cred)
+		return apply_preauthentication(buf, t);
 
+	/*
+	 * If we do have creds, find the first mechanism supported by both
+	 * the server and ourselves that supports the credential type.
+	 */
 	if (!cred)
 		return 0;
 
-	/* Get or create a context for the best scheme for this cred type */
-	if (auth_context_match(&context, t, credtype_match, &cred->credtype) < 0)
+	printf("Actually authenticating...\n");
+
+	data.server_types = t->server_types;
+	data.credtype = cred->credtype;
+
+	if (auth_context_match(&context, t, auth_match, &data) < 0)
 		return -1;
 
+	if (!context) {
+		giterr_set(GITERR_NET, "no suitable mechanism found for authentication");
+		return -1;
+	}
+
+	printf("next tokening : %d %p...\n", context->type,  context->next_token);
 	return context->next_token(buf, context, cred);
 }
 
@@ -224,7 +298,7 @@ static int gen_request(
 	}
 
 	/* Apply credentials to the request */
-	if (apply_credentials(buf, t) < 0)
+	if (apply_authentication(buf, t) < 0)
 		return -1;
 
 	git_buf_puts(buf, "\r\n");
@@ -238,13 +312,17 @@ static int gen_request(
 static int parse_authenticate_response(
 	git_vector *www_authenticate,
 	http_subtransport *t,
-	int *allowed_types)
+	int *allowed_credtypes)
 {
 	git_http_auth_context *context;
 	char *challenge;
 	size_t i;
 
+	t->server_types = 0;
+
 	git_vector_foreach(www_authenticate, i, challenge) {
+		printf("challenge: %s\n", challenge);
+
 		if (auth_context_match(&context, t, challenge_match, challenge) < 0)
 			return -1;
 		else if (!context)
@@ -254,7 +332,8 @@ static int parse_authenticate_response(
 			context->set_challenge(context, challenge) < 0)
 			return -1;
 
-		*allowed_types |= context->credtypes;
+		t->server_types |= context->type;
+		*allowed_credtypes |= context->credtypes;
 	}
 
 	return 0;
@@ -331,7 +410,7 @@ static int on_headers_complete(http_parser *parser)
 	http_subtransport *t = ctx->t;
 	http_stream *s = ctx->s;
 	git_buf buf = GIT_BUF_INIT;
-	int error = 0, no_callback = 0, allowed_auth_types = 0;
+	int error = 0, no_callback = 0, allowed_credtypes = 0;
 
 	/* Both parse_header_name and parse_header_value are populated
 	 * and ready for consumption. */
@@ -344,7 +423,7 @@ static int on_headers_complete(http_parser *parser)
 	 * complete.)
 	 */
 	if (parse_authenticate_response(&t->www_authenticate, t,
-			&allowed_auth_types) < 0)
+			&allowed_credtypes) < 0)
 		return t->parse_error = PARSE_ERROR_GENERIC;
 
 	/* Check for an authentication failure. */
@@ -352,7 +431,7 @@ static int on_headers_complete(http_parser *parser)
 		if (!t->owner->cred_acquire_cb) {
 			no_callback = 1;
 		} else {
-			if (allowed_auth_types) {
+			if (allowed_credtypes) {
 				if (t->cred) {
 					t->cred->free(t->cred);
 					t->cred = NULL;
@@ -361,7 +440,7 @@ static int on_headers_complete(http_parser *parser)
 				error = t->owner->cred_acquire_cb(&t->cred,
 								  t->owner->url,
 								  t->connection_data.user,
-								  allowed_auth_types,
+								  allowed_credtypes,
 								  t->owner->cred_acquire_payload);
 
 				if (error == GIT_PASSTHROUGH) {
@@ -372,7 +451,7 @@ static int on_headers_complete(http_parser *parser)
 				} else {
 					assert(t->cred);
 
-					if (!(t->cred->credtype & allowed_auth_types)) {
+					if (!(t->cred->credtype & allowed_credtypes)) {
 						giterr_set(GITERR_NET, "credentials callback returned an invalid cred type");
 						return t->parse_error = PARSE_ERROR_GENERIC;
 					}
@@ -520,6 +599,7 @@ static void clear_parser_state(http_subtransport *t)
 	git__free(t->location);
 	t->location = NULL;
 
+	printf("cleaning up state...\n");
 	git_vector_free_deep(&t->www_authenticate);
 }
 
