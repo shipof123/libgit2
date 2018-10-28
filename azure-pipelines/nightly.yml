@@ -174,6 +174,20 @@ jobs:
        CMAKE_OPTIONS=-DUSE_HTTPS=OpenSSL
        SKIP_PROXY_TESTS=true
 
+- job: linux_ppc64el_xenial_gcc_openssl
+  displayName: 'Linux (ppc64el; Xenial; GCC; OpenSSL)'
+  pool:
+    vmImage: 'Ubuntu 16.04'
+  steps:
+  - template: docker.yml
+    parameters:
+      qemu: 'true'
+      imageName: 'libgit2/xenial-ppc64el:latest'
+      environmentVariables: |
+       CC=gcc
+       CMAKE_OPTIONS=-DUSE_HTTPS=OpenSSL
+       SKIP_PROXY_TESTS=true
+
 - job: coverity
   displayName: 'Coverity'
   pool:
