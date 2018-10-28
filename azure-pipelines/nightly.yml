@@ -126,7 +126,7 @@ jobs:
   - template: docker.yml
     parameters:
       qemu: 'true'
-      imageName: 'libgit2/bionic-x86:test'
+      imageName: 'libgit2/bionic-x86:latest'
       environmentVariables: |
        CC=gcc
        CMAKE_OPTIONS=-DUSE_HTTPS=OpenSSL
@@ -140,7 +140,7 @@ jobs:
   - template: docker.yml
     parameters:
       qemu: 'true'
-      imageName: 'libgit2/bionic-x86:test'
+      imageName: 'libgit2/bionic-x86:latest'
       environmentVariables: |
        CC=clang
        CMAKE_OPTIONS=-DUSE_HTTPS=OpenSSL
@@ -154,7 +154,7 @@ jobs:
   - template: docker.yml
     parameters:
       qemu: 'true'
-      imageName: 'libgit2/bionic-arm32:test'
+      imageName: 'libgit2/bionic-arm32:latest'
       environmentVariables: |
        CC=gcc
        CMAKE_OPTIONS=-DUSE_HTTPS=OpenSSL
@@ -168,7 +168,7 @@ jobs:
   - template: docker.yml
     parameters:
       qemu: 'true'
-      imageName: 'libgit2/bionic-arm64:test'
+      imageName: 'libgit2/bionic-arm64:latest'
       environmentVariables: |
        CC=gcc
        CMAKE_OPTIONS=-DUSE_HTTPS=OpenSSL
