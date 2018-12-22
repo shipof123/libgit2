@@ -30,7 +30,7 @@ GIT_BEGIN_DECL
  * @param out new signature, in case of error NULL
  * @param name name of the person
  * @param email email of the person
- * @param time time when the action happened
+ * @param time time(in seconds from the epoch) when the action happened
  * @param offset timezone offset in minutes for the time
  * @return 0 or an error code
  */
